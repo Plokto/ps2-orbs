@@ -1,5 +1,20 @@
-use crate::config::OrbMode;
+use crate::scenes::{
+    create_blend_state, create_buffer, create_rasterizer, create_vs_ps, set_viewport,
+    update_dynamic_slice, BlendMode, FrameInput, Scene,
+};
 use std::f32::consts::{PI, TAU};
+use std::mem::size_of;
+use windows::core::s;
+use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11BlendState, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11InputLayout,
+    ID3D11PixelShader, ID3D11RasterizerState, ID3D11RenderTargetView, ID3D11ShaderResourceView,
+    ID3D11VertexShader, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_BIND_VERTEX_BUFFER,
+    D3D11_INPUT_ELEMENT_DESC, D3D11_INPUT_PER_VERTEX_DATA,
+};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -7,10 +22,189 @@ pub struct Vertex {
     pub pos: [f32; 2],
     pub uv: [f32; 2],
     pub color: [f32; 4],
-    pub params: [f32; 2], // [glow_pow, core_intensity]
+    pub params: [f32; 2],
 }
 
 pub const MAX_VERTICES: usize = 8192;
+
+const VS_HLSL: &str = r#"
+struct VSIn {
+    float2 pos    : POSITION;
+    float2 uv     : TEXCOORD0;
+    float4 color  : COLOR0;
+    float2 params : TEXCOORD1;
+};
+struct VSOut {
+    float4 pos    : SV_Position;
+    float2 uv     : TEXCOORD0;
+    float4 color  : COLOR0;
+    float2 params : TEXCOORD1;
+};
+VSOut main(VSIn input) {
+    VSOut output;
+    output.pos    = float4(input.pos, 0.0, 1.0);
+    output.uv     = input.uv;
+    output.color  = input.color;
+    output.params = input.params;
+    return output;
+}
+"#;
+
+const PS_HLSL: &str = r#"
+struct PSIn {
+    float4 pos    : SV_Position;
+    float2 uv     : TEXCOORD0;
+    float4 color  : COLOR0;
+    float2 params : TEXCOORD1;
+};
+float4 main(PSIn input) : SV_Target {
+    float r2 = dot(input.uv, input.uv);
+    float d = saturate(1.0 - r2);
+    float glow = (d > 0.0) ? pow(d, input.params.x) : 0.0;
+    float core_mask = 1.0 - smoothstep(0.65, 1.0, r2);
+    float core = input.params.y * exp(-r2 * 14.0) * core_mask;
+    float3 col = input.color.rgb * glow + float3(0.92, 0.98, 1.0) * core;
+
+    float max_c = max(col.r, max(col.g, col.b));
+    if (max_c > 0.002) {
+        float2 p = input.pos.xy;
+        float n = frac(sin(dot(p, float2(12.9898, 78.233))) * 43758.5453);
+        col += (n - 0.5) * (1.0 / 255.0);
+    }
+    return float4(max(col, 0.0), 1.0);
+}
+"#;
+
+pub struct Ps2OrbsScene {
+    vivid_trails: bool,
+    vs: ID3D11VertexShader,
+    ps: ID3D11PixelShader,
+    input_layout: ID3D11InputLayout,
+    vb: ID3D11Buffer,
+    blend_state: ID3D11BlendState,
+    rast_state: ID3D11RasterizerState,
+    verts: Vec<Vertex>,
+}
+
+impl Ps2OrbsScene {
+    pub fn new(device: &ID3D11Device, vivid_trails: bool) -> Result<Self, String> {
+        let (vs_bytes, vs, ps) = create_vs_ps(device, VS_HLSL, PS_HLSL)?;
+        let layout_desc = [
+            D3D11_INPUT_ELEMENT_DESC {
+                SemanticName: s!("POSITION"),
+                SemanticIndex: 0,
+                Format: DXGI_FORMAT_R32G32_FLOAT,
+                InputSlot: 0,
+                AlignedByteOffset: 0,
+                InputSlotClass: D3D11_INPUT_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            },
+            D3D11_INPUT_ELEMENT_DESC {
+                SemanticName: s!("TEXCOORD"),
+                SemanticIndex: 0,
+                Format: DXGI_FORMAT_R32G32_FLOAT,
+                InputSlot: 0,
+                AlignedByteOffset: D3D11_APPEND_ALIGNED_ELEMENT,
+                InputSlotClass: D3D11_INPUT_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            },
+            D3D11_INPUT_ELEMENT_DESC {
+                SemanticName: s!("COLOR"),
+                SemanticIndex: 0,
+                Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                InputSlot: 0,
+                AlignedByteOffset: D3D11_APPEND_ALIGNED_ELEMENT,
+                InputSlotClass: D3D11_INPUT_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            },
+            D3D11_INPUT_ELEMENT_DESC {
+                SemanticName: s!("TEXCOORD"),
+                SemanticIndex: 1,
+                Format: DXGI_FORMAT_R32G32_FLOAT,
+                InputSlot: 0,
+                AlignedByteOffset: D3D11_APPEND_ALIGNED_ELEMENT,
+                InputSlotClass: D3D11_INPUT_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            },
+        ];
+
+        let input_layout = unsafe {
+            let mut il: Option<ID3D11InputLayout> = None;
+            device
+                .CreateInputLayout(&layout_desc, &vs_bytes, Some(&mut il))
+                .map_err(|e| format!("CreateInputLayout ps2_orbs: {e}"))?;
+            il.ok_or("No input layout")?
+        };
+
+        let vb = create_buffer(
+            device,
+            (MAX_VERTICES * size_of::<Vertex>()) as u32,
+            D3D11_BIND_VERTEX_BUFFER.0 as u32,
+            true,
+            None,
+        )?;
+        let blend_state = create_blend_state(device, BlendMode::Additive)?;
+        let rast_state = create_rasterizer(device, false, false)?;
+
+        Ok(Self {
+            vivid_trails,
+            vs,
+            ps,
+            input_layout,
+            vb,
+            blend_state,
+            rast_state,
+            verts: Vec::with_capacity(MAX_VERTICES),
+        })
+    }
+}
+
+impl Scene for Ps2OrbsScene {
+    fn resize(&mut self, _device: &ID3D11Device, _width: u32, _height: u32) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn render(
+        &mut self,
+        context: &ID3D11DeviceContext,
+        rtv: &ID3D11RenderTargetView,
+        _backbuf_srv: Option<&ID3D11ShaderResourceView>,
+        input: &FrameInput,
+    ) {
+        let fly_in = if input.is_capture { 4.0 } else { input.elapsed };
+        build_frame_vertices(
+            &mut self.verts,
+            self.vivid_trails,
+            input.clock_sec,
+            fly_in,
+            input.width,
+            input.height,
+        );
+
+        unsafe {
+            let rtv_slice = [Some(rtv.clone())];
+            context.OMSetRenderTargets(Some(&rtv_slice), None);
+            context.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0]);
+            set_viewport(context, input.width, input.height);
+            context.OMSetBlendState(&self.blend_state, None, 0xFFFF_FFFF);
+            context.RSSetState(&self.rast_state);
+            context.IASetInputLayout(&self.input_layout);
+            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context.VSSetShader(&self.vs, None);
+            context.PSSetShader(&self.ps, None);
+
+            let count = self.verts.len().min(MAX_VERTICES);
+            if count > 0 {
+                update_dynamic_slice(context, &self.vb, &self.verts[..count]);
+                let stride = size_of::<Vertex>() as u32;
+                let offset = 0u32;
+                let vbs = [Some(self.vb.clone())];
+                context.IASetVertexBuffers(0, 1, Some(vbs.as_ptr()), Some(&stride), Some(&offset));
+                context.Draw(count as u32, 0);
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Vec2 {
@@ -182,9 +376,6 @@ struct Ps2Camera {
 }
 
 impl Ps2Camera {
-    /// Builds the exact MenuCameraMatrix (0x22ED20) from osdbits/menu.c:
-    /// fixed Euler rotation {0.031, 0.145, 0.0} applied to pos/fwd/up,
-    /// with startup fly-in easing at 0.97^(60 * fly_in_sec).
     fn new(base_dist: f32, fly_in_sec: f32) -> Self {
         let z_offset = -59.0 * 0.97f32.powf((fly_in_sec * 60.0).max(0.0));
         let cam_local = Vec3::new(0.0, 0.0, -base_dist + z_offset);
@@ -221,11 +412,6 @@ impl Ps2Camera {
     }
 }
 
-/// Evaluates the exact decompiled PS2 OSDSYS orbit (0x2261B8) for orb i in 0..7
-/// driven by local clock seconds (sec, min, hour).
-///
-/// Post-multiplied chain from osdbits/menu.c:
-///   RotZ(tiltZ) * RotZ(PI) * RotY(rateY * 1100.0) * RotX((i + 21) * rateX) * [0, radius, 0]
 #[inline]
 fn eval_ps2_orb(i: usize, clock_sec: f64, cam: &Ps2Camera) -> (Vec2, f32) {
     let sec = clock_sec.rem_euclid(60.0) as f32;
@@ -269,10 +455,6 @@ fn compute_ribbon_normals(pts: &[Vec2], norms: &mut [Vec2]) {
     }
 }
 
-/// Mode 1: Authentic decompiled PS2 BIOS Clock Orbs (0x2261B8 + 0x22EFF0)
-/// - 7 orbs driven by exact (i + 21) * sec and 1100 * min rotations
-/// - 2.2-second trails with asymmetric chromatic decay (R*u^4, G*u^2, B*u)
-/// - orbBaseColor {0x30, 0x62, 0x80} = (0.375, 0.766, 1.0) steel-aqua halo + white core
 fn build_ps2_original(verts: &mut Vec<Vertex>, clock_sec: f64, fly_in_sec: f32, inv_aspect: f32) {
     const TRAIL_STEPS: usize = 72;
     const TRAIL_SPAN: f64 = 2.20;
@@ -292,7 +474,6 @@ fn build_ps2_original(verts: &mut Vec<Vertex>, clock_sec: f64, fly_in_sec: f32, 
         }
         compute_ribbon_normals(&pts, &mut norms);
 
-        // 1a. Delicate gossamer outer trail glow
         for k in 0..TRAIL_STEPS {
             let u0 = 1.0 - (k as f32) / (TRAIL_STEPS as f32);
             let u1 = 1.0 - ((k + 1) as f32) / (TRAIL_STEPS as f32);
@@ -322,7 +503,6 @@ fn build_ps2_original(verts: &mut Vec<Vertex>, clock_sec: f64, fly_in_sec: f32, 
             );
         }
 
-        // 1b. Slender crisp PS2 line-strip core with exact (u^4, u^2, u) decay
         for k in 0..TRAIL_STEPS {
             let u0 = 1.0 - (k as f32) / (TRAIL_STEPS as f32);
             let u1 = 1.0 - ((k + 1) as f32) / (TRAIL_STEPS as f32);
@@ -352,7 +532,6 @@ fn build_ps2_original(verts: &mut Vec<Vertex>, clock_sec: f64, fly_in_sec: f32, 
             );
         }
 
-        // 2. Authentic jewel-like orb head: soft TEXCBLUR halo + inner aqua + crisp TEXCNAVI core
         let head = pts[0];
         let d = depths[0];
 
@@ -386,7 +565,6 @@ fn build_ps2_original(verts: &mut Vec<Vertex>, clock_sec: f64, fly_in_sec: f32, 
     }
 }
 
-/// Mode 2: Vivid Violet Trails on the authentic PS2 3D clock-harmonic orbit
 fn build_ps2_vivid_trails(
     verts: &mut Vec<Vertex>,
     clock_sec: f64,
@@ -416,7 +594,6 @@ fn build_ps2_vivid_trails(
         }
         compute_ribbon_normals(&pts, &mut norms);
 
-        // 1a. Wide lush cyan -> blue -> indigo-violet nebula ribbon
         for k in 0..TRAIL_STEPS {
             let f0 = (k as f32) / (TRAIL_STEPS as f32);
             let f1 = ((k + 1) as f32) / (TRAIL_STEPS as f32);
@@ -449,7 +626,6 @@ fn build_ps2_vivid_trails(
             );
         }
 
-        // 1b. Crisp bright cyan-blue inner thread
         for k in 0..TRAIL_STEPS {
             let f0 = (k as f32) / (TRAIL_STEPS as f32);
             let f1 = ((k + 1) as f32) / (TRAIL_STEPS as f32);
@@ -480,7 +656,6 @@ fn build_ps2_vivid_trails(
             );
         }
 
-        // 2. Subtle fading plasma-echo beads along the first 1.2s of the trail
         for b in 1..=BEAD_COUNT {
             let frac = (b as f32) / ((BEAD_COUNT + 1) as f32);
             let lag = (frac as f64) * 1.20;
@@ -511,7 +686,6 @@ fn build_ps2_vivid_trails(
             );
         }
 
-        // 3. Luminous white-cyan orb head
         let head = pts[0];
         let d = depths[0];
 
@@ -545,9 +719,9 @@ fn build_ps2_vivid_trails(
     }
 }
 
-pub fn build_frame_vertices(
+fn build_frame_vertices(
     verts: &mut Vec<Vertex>,
-    mode: OrbMode,
+    vivid_trails: bool,
     clock_sec: f64,
     fly_in_sec: f32,
     width: u32,
@@ -558,8 +732,9 @@ pub fn build_frame_vertices(
     let w = width.max(1) as f32;
     let inv_aspect = h / w;
 
-    match mode {
-        OrbMode::Menu => build_ps2_original(verts, clock_sec, fly_in_sec, inv_aspect),
-        OrbMode::Trail => build_ps2_vivid_trails(verts, clock_sec, fly_in_sec, inv_aspect),
+    if vivid_trails {
+        build_ps2_vivid_trails(verts, clock_sec, fly_in_sec, inv_aspect);
+    } else {
+        build_ps2_original(verts, clock_sec, fly_in_sec, inv_aspect);
     }
 }

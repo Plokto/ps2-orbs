@@ -9,9 +9,41 @@ use windows::Win32::System::Registry::{
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OrbMode {
-    Menu,
-    Trail,
+pub enum SceneId {
+    Ps2Original,
+    Ps2Vivid,
+    Ps2Towers,
+    Ps3Oled,
+    Ps3Classic,
+    PspWave,
+    Ps4Flow,
+}
+
+impl SceneId {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "menu" | "ps2_original" | "ps2-original" => Some(Self::Ps2Original),
+            "trail" | "ps2_vivid" | "ps2-vivid" => Some(Self::Ps2Vivid),
+            "ps2_towers" | "ps2-towers" | "towers" => Some(Self::Ps2Towers),
+            "ps3_oled" | "ps3-oled" => Some(Self::Ps3Oled),
+            "ps3_classic" | "ps3-classic" | "ps3" => Some(Self::Ps3Classic),
+            "psp_wave" | "psp-wave" | "psp" => Some(Self::PspWave),
+            "ps4_flow" | "ps4-flow" | "ps4" => Some(Self::Ps4Flow),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ps2Original => "ps2_original",
+            Self::Ps2Vivid => "ps2_vivid",
+            Self::Ps2Towers => "ps2_towers",
+            Self::Ps3Oled => "ps3_oled",
+            Self::Ps3Classic => "ps3_classic",
+            Self::PspWave => "psp_wave",
+            Self::Ps4Flow => "ps4_flow",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,7 +54,7 @@ pub enum ResMode {
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub mode: OrbMode,
+    pub scene: SceneId,
     pub res_mode: ResMode,
     pub fps_cap: u32,
     pub auto_pause: bool,
@@ -32,7 +64,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            mode: OrbMode::Menu,
+            scene: SceneId::Ps2Original,
             res_mode: ResMode::Fhd,
             fps_cap: 60,
             auto_pause: true,
@@ -55,11 +87,10 @@ impl Config {
                         let k = k.trim();
                         let v = v.trim();
                         match k {
-                            "mode" => {
-                                cfg.mode = match v {
-                                    "trail" => OrbMode::Trail,
-                                    _ => OrbMode::Menu,
-                                };
+                            "mode" | "scene" => {
+                                if let Some(id) = SceneId::parse(v) {
+                                    cfg.scene = id;
+                                }
                             }
                             "res_mode" => {
                                 cfg.res_mode = match v {
@@ -86,17 +117,13 @@ impl Config {
     }
 
     pub fn save(&self) {
-        let mode_str = match self.mode {
-            OrbMode::Menu => "menu",
-            OrbMode::Trail => "trail",
-        };
         let res_str = match self.res_mode {
             ResMode::Fhd => "fhd",
             ResMode::Qhd => "qhd",
         };
         let content = format!(
             "mode={}\nres_mode={}\nfps_cap={}\nauto_pause={}\nmanual_pause={}\n",
-            mode_str,
+            self.scene.as_str(),
             res_str,
             self.fps_cap,
             if self.auto_pause { 1 } else { 0 },

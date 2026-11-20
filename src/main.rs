@@ -1,22 +1,23 @@
 #![windows_subsystem = "windows"]
 
 mod config;
-mod orbs;
 mod renderer;
+mod scenes;
 mod tray;
 mod wallpaper;
 
-use config::{desktop_wallpaper_restore_path, set_autostart, Config, OrbMode, ResMode};
-use orbs::{build_frame_vertices, Vertex, MAX_VERTICES};
+use config::{desktop_wallpaper_restore_path, set_autostart, Config, ResMode, SceneId};
 use renderer::{is_device_lost, Renderer};
+use scenes::FrameInput;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use tray::{
     handle_power_broadcast, handle_session_change, is_tray_click, show_popup_menu, TrayState,
-    IDM_AUTOPAUSE, IDM_AUTOSTART, IDM_EXIT, IDM_FPS_30, IDM_FPS_60, IDM_MANUAL_PAUSE,
-    IDM_MODE_MENU, IDM_MODE_TRAIL, IDM_RES_FHD, IDM_RES_QHD, WM_OPEN_MENU, WM_TRAY_ICON,
-    WM_WTSSESSION_CHANGE_MSG,
+    IDM_AUTOPAUSE, IDM_AUTOSTART, IDM_EXIT, IDM_FPS_30, IDM_FPS_60, IDM_MANUAL_PAUSE, IDM_RES_FHD,
+    IDM_RES_QHD, IDM_SCENE_PS2_ORIGINAL, IDM_SCENE_PS2_TOWERS, IDM_SCENE_PS2_VIVID,
+    IDM_SCENE_PS3_CLASSIC, IDM_SCENE_PS3_OLED, IDM_SCENE_PS4_FLOW, IDM_SCENE_PSP_WAVE,
+    WM_OPEN_MENU, WM_TRAY_ICON, WM_WTSSESSION_CHANGE_MSG,
 };
 use wallpaper::{
     attach_to_workerw, find_workerw, get_primary_display_info, is_desktop_occluded, pin_to_bottom,
@@ -58,6 +59,7 @@ struct AppState {
     display_off: bool,
     occluded: bool,
     needs_resize: bool,
+    needs_scene_switch: bool,
     needs_redraw: bool,
     quit: bool,
     tray: Option<TrayState>,
@@ -140,17 +142,23 @@ unsafe extern "system" fn wall_wnd_proc(
 }
 
 fn apply_menu_command(st: &mut AppState, cmd: usize) {
+    let set_scene = |st: &mut AppState, id: SceneId| {
+        if st.cfg.scene != id {
+            st.cfg.scene = id;
+            st.cfg.save();
+            st.needs_scene_switch = true;
+            st.needs_redraw = true;
+        }
+    };
+
     match cmd {
-        IDM_MODE_MENU => {
-            st.cfg.mode = OrbMode::Menu;
-            st.cfg.save();
-            st.needs_redraw = true;
-        }
-        IDM_MODE_TRAIL => {
-            st.cfg.mode = OrbMode::Trail;
-            st.cfg.save();
-            st.needs_redraw = true;
-        }
+        IDM_SCENE_PS2_ORIGINAL => set_scene(st, SceneId::Ps2Original),
+        IDM_SCENE_PS2_VIVID => set_scene(st, SceneId::Ps2Vivid),
+        IDM_SCENE_PS2_TOWERS => set_scene(st, SceneId::Ps2Towers),
+        IDM_SCENE_PS3_OLED => set_scene(st, SceneId::Ps3Oled),
+        IDM_SCENE_PS3_CLASSIC => set_scene(st, SceneId::Ps3Classic),
+        IDM_SCENE_PSP_WAVE => set_scene(st, SceneId::PspWave),
+        IDM_SCENE_PS4_FLOW => set_scene(st, SceneId::Ps4Flow),
         IDM_RES_FHD => {
             st.cfg.res_mode = ResMode::Fhd;
             st.cfg.save();
@@ -300,7 +308,7 @@ unsafe extern "system" fn tray_wnd_proc(
 struct CliArgs {
     preview: bool,
     no_autopause: bool,
-    mode_override: Option<OrbMode>,
+    scene_override: Option<SceneId>,
     res_override: Option<ResMode>,
     time_override: Option<f64>,
     capture_path: Option<PathBuf>,
@@ -310,7 +318,7 @@ fn parse_args() -> CliArgs {
     let mut out = CliArgs {
         preview: false,
         no_autopause: false,
-        mode_override: None,
+        scene_override: None,
         res_override: None,
         time_override: None,
         capture_path: None,
@@ -322,12 +330,10 @@ fn parse_args() -> CliArgs {
             "--no-autopause" => out.no_autopause = true,
             "--qhd" => out.res_override = Some(ResMode::Qhd),
             "--fhd" => out.res_override = Some(ResMode::Fhd),
-            "--mode" => {
+            "--mode" | "--scene" => {
                 if let Some(m) = args.next() {
-                    if m.eq_ignore_ascii_case("trail") {
-                        out.mode_override = Some(OrbMode::Trail);
-                    } else if m.eq_ignore_ascii_case("menu") {
-                        out.mode_override = Some(OrbMode::Menu);
+                    if let Some(id) = SceneId::parse(&m) {
+                        out.scene_override = Some(id);
                     }
                 }
             }
@@ -349,13 +355,14 @@ fn parse_args() -> CliArgs {
     out
 }
 
-fn local_clock_seconds() -> f64 {
+fn local_clock_info() -> (f64, u32, u32) {
     unsafe {
         let st = GetLocalTime();
-        (st.wHour as f64) * 3600.0
+        let sec = (st.wHour as f64) * 3600.0
             + (st.wMinute as f64) * 60.0
             + (st.wSecond as f64)
-            + (st.wMilliseconds as f64) / 1000.0
+            + (st.wMilliseconds as f64) / 1000.0;
+        (sec, st.wMonth as u32, st.wDay as u32)
     }
 }
 
@@ -401,12 +408,21 @@ unsafe fn run_capture(cli: &CliArgs) -> Result<(), String> {
     )
     .map_err(|e| format!("CreateWindowExW capture: {e}"))?;
 
-    let renderer = Renderer::new(hwnd, w, h)?;
-    let mode = cli.mode_override.unwrap_or(OrbMode::Menu);
-    let clock_sec = cli.time_override.unwrap_or(17.5);
-    let mut verts = Vec::<Vertex>::with_capacity(MAX_VERTICES);
-    build_frame_vertices(&mut verts, mode, clock_sec, 4.0, w, h);
-    renderer.draw_only(&verts);
+    let scene = cli.scene_override.unwrap_or(SceneId::Ps2Original);
+    let mut renderer = Renderer::new(hwnd, w, h, scene)?;
+    let (local_sec, month, day) = local_clock_info();
+    let clock_sec = cli.time_override.unwrap_or(local_sec);
+    let input = FrameInput {
+        clock_sec,
+        month,
+        day,
+        dt: 1.0 / 60.0,
+        elapsed: cli.time_override.map(|v| v as f32).unwrap_or(4.5),
+        width: w,
+        height: h,
+        is_capture: true,
+    };
+    renderer.draw_only(&input);
     let path = cli.capture_path.as_ref().unwrap();
     renderer.capture_bmp(path)?;
     let _ = DestroyWindow(hwnd);
@@ -463,8 +479,8 @@ fn main() {
     }
 
     let mut cfg = Config::load();
-    if let Some(m) = cli.mode_override {
-        cfg.mode = m;
+    if let Some(s) = cli.scene_override {
+        cfg.scene = s;
     }
     if let Some(r) = cli.res_override {
         cfg.res_mode = r;
@@ -593,6 +609,7 @@ fn main() {
             display_off: false,
             occluded: false,
             needs_resize: false,
+            needs_scene_switch: false,
             needs_redraw: true,
             quit: false,
             tray: Some(tray),
@@ -602,16 +619,17 @@ fn main() {
             *cell.borrow_mut() = Some(app.clone());
         });
 
-        let (init_rw, init_rh) = {
+        let (init_rw, init_rh, init_scene) = {
             let st = app.borrow();
-            if st.preview_mode {
+            let (w, h) = if st.preview_mode {
                 (win_w, win_h)
             } else {
                 st.desired_render_size()
-            }
+            };
+            (w, h, st.cfg.scene)
         };
 
-        let mut renderer = match Renderer::new(wall_hwnd, init_rw, init_rh) {
+        let mut renderer = match Renderer::new(wall_hwnd, init_rw, init_rh, init_scene) {
             Ok(r) => r,
             Err(_) => {
                 let mut st = app.borrow_mut();
@@ -645,11 +663,11 @@ fn main() {
         let mut last_occ_qpc = qpc_now() - occ_interval;
         let mut last_frame_qpc = qpc_now();
         let mut next_frame_qpc = last_frame_qpc;
-        let mut base_clock_sec: f64 = cli.time_override.unwrap_or_else(local_clock_seconds);
+        let (init_sec, mut cur_month, mut cur_day) = local_clock_info();
+        let mut base_clock_sec: f64 = cli.time_override.unwrap_or(init_sec);
         let mut elapsed_anim_sec: f64 = 0.0;
-        let mut fly_in_sec: f32 = 0.0;
+        let mut total_elapsed: f32 = 0.0;
         let mut was_paused = false;
-        let mut verts = Vec::<Vertex>::with_capacity(MAX_VERTICES);
 
         let mut msg = MSG::default();
         loop {
@@ -691,7 +709,16 @@ fn main() {
                 }
             }
 
-            let (paused, needs_resize, needs_redraw, mode, fps_cap, target_rw, target_rh) = {
+            let (
+                paused,
+                needs_resize,
+                needs_scene_switch,
+                needs_redraw,
+                scene_id,
+                fps_cap,
+                target_rw,
+                target_rh,
+            ) = {
                 let st = app.borrow();
                 let (rw, rh) = if st.preview_mode {
                     let mut rc = windows::Win32::Foundation::RECT::default();
@@ -706,17 +733,28 @@ fn main() {
                 (
                     st.is_paused(),
                     st.needs_resize,
+                    st.needs_scene_switch,
                     st.needs_redraw,
-                    st.cfg.mode,
+                    st.cfg.scene,
                     st.cfg.fps_cap.clamp(15, 60),
                     rw,
                     rh,
                 )
             };
 
+            if needs_scene_switch {
+                if renderer.set_scene(scene_id).is_err() {
+                    if let Ok(new_r) = Renderer::new(wall_hwnd, target_rw, target_rh, scene_id) {
+                        renderer = new_r;
+                    }
+                }
+                total_elapsed = 0.0;
+                app.borrow_mut().needs_scene_switch = false;
+            }
+
             if needs_resize {
                 if renderer.resize(target_rw, target_rh).is_err() {
-                    if let Ok(new_r) = Renderer::new(wall_hwnd, target_rw, target_rh) {
+                    if let Ok(new_r) = Renderer::new(wall_hwnd, target_rw, target_rh, scene_id) {
                         renderer = new_r;
                     }
                 }
@@ -753,7 +791,10 @@ fn main() {
             if now >= next_frame_qpc || needs_redraw {
                 if was_paused && !paused {
                     if cli.time_override.is_none() {
-                        base_clock_sec = local_clock_seconds();
+                        let (s, m, d) = local_clock_info();
+                        base_clock_sec = s;
+                        cur_month = m;
+                        cur_day = d;
                         elapsed_anim_sec = 0.0;
                     }
                     was_paused = false;
@@ -762,21 +803,23 @@ fn main() {
                 last_frame_qpc = now;
                 if !paused {
                     elapsed_anim_sec += dt as f64;
-                    fly_in_sec = (fly_in_sec + dt).min(4.0);
+                    total_elapsed += dt;
                 }
 
-                let clock_sec = base_clock_sec + elapsed_anim_sec;
-                build_frame_vertices(
-                    &mut verts,
-                    mode,
-                    clock_sec,
-                    fly_in_sec,
-                    renderer.width,
-                    renderer.height,
-                );
-                if let Err(hr) = renderer.draw_and_present(&verts) {
+                let frame_in = FrameInput {
+                    clock_sec: base_clock_sec + elapsed_anim_sec,
+                    month: cur_month,
+                    day: cur_day,
+                    dt,
+                    elapsed: total_elapsed,
+                    width: renderer.width,
+                    height: renderer.height,
+                    is_capture: false,
+                };
+                if let Err(hr) = renderer.draw_and_present(&frame_in) {
                     if is_device_lost(hr) {
-                        if let Ok(new_r) = Renderer::new(wall_hwnd, target_rw, target_rh) {
+                        if let Ok(new_r) = Renderer::new(wall_hwnd, target_rw, target_rh, scene_id)
+                        {
                             renderer = new_r;
                         }
                     }

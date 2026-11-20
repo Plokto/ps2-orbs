@@ -1,4 +1,4 @@
-use crate::config::{is_autostart_enabled, Config, OrbMode, ResMode};
+use crate::config::{is_autostart_enabled, Config, ResMode, SceneId};
 use std::ffi::c_void;
 use std::mem::size_of;
 use windows::core::w;
@@ -30,16 +30,22 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub const WM_TRAY_ICON: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
 pub const WM_OPEN_MENU: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 2;
 
-pub const IDM_MODE_MENU: usize = 1001;
-pub const IDM_MODE_TRAIL: usize = 1002;
-pub const IDM_RES_FHD: usize = 1003;
-pub const IDM_RES_QHD: usize = 1004;
-pub const IDM_FPS_30: usize = 1005;
-pub const IDM_FPS_60: usize = 1006;
-pub const IDM_AUTOPAUSE: usize = 1007;
-pub const IDM_MANUAL_PAUSE: usize = 1008;
-pub const IDM_AUTOSTART: usize = 1009;
-pub const IDM_EXIT: usize = 1010;
+pub const IDM_SCENE_PS2_ORIGINAL: usize = 1001;
+pub const IDM_SCENE_PS2_VIVID: usize = 1002;
+pub const IDM_SCENE_PS2_TOWERS: usize = 1003;
+pub const IDM_SCENE_PS3_OLED: usize = 1004;
+pub const IDM_SCENE_PS3_CLASSIC: usize = 1005;
+pub const IDM_SCENE_PSP_WAVE: usize = 1006;
+pub const IDM_SCENE_PS4_FLOW: usize = 1007;
+
+pub const IDM_RES_FHD: usize = 1020;
+pub const IDM_RES_QHD: usize = 1021;
+pub const IDM_FPS_30: usize = 1022;
+pub const IDM_FPS_60: usize = 1023;
+pub const IDM_AUTOPAUSE: usize = 1024;
+pub const IDM_MANUAL_PAUSE: usize = 1025;
+pub const IDM_AUTOSTART: usize = 1026;
+pub const IDM_EXIT: usize = 1027;
 
 pub const WM_WTSSESSION_CHANGE_MSG: u32 = 0x02B1;
 
@@ -87,7 +93,7 @@ impl TrayState {
             hIcon: self.hicon,
             ..Default::default()
         };
-        let tip: Vec<u16> = "PS2 Orbs Wallpaper".encode_utf16().collect();
+        let tip: Vec<u16> = "PlayStation Live Wallpapers".encode_utf16().collect();
         let copy_len = tip.len().min(nid.szTip.len() - 1);
         nid.szTip[..copy_len].copy_from_slice(&tip[..copy_len]);
         if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
@@ -124,17 +130,33 @@ pub unsafe fn show_popup_menu(hwnd: HWND, cfg: &Config) -> usize {
         return 0;
     };
 
-    let _ = AppendMenuW(hmenu, MF_STRING, IDM_MODE_MENU, w!("PS2 Original (BIOS Clock)"));
-    let _ = AppendMenuW(hmenu, MF_STRING, IDM_MODE_TRAIL, w!("PS2 Vivid Violet Trails"));
-    let mode_id = match cfg.mode {
-        OrbMode::Menu => IDM_MODE_MENU as u32,
-        OrbMode::Trail => IDM_MODE_TRAIL as u32,
+    let _ = AppendMenuW(hmenu, MF_STRING, IDM_SCENE_PS2_ORIGINAL, w!("PS2 Original (BIOS Clock)"));
+    let _ = AppendMenuW(hmenu, MF_STRING, IDM_SCENE_PS2_VIVID, w!("PS2 Vivid Violet Trails"));
+    let _ = AppendMenuW(hmenu, MF_STRING, IDM_SCENE_PS2_TOWERS, w!("PS2 Startup Towers"));
+    let _ = AppendMenuW(hmenu, MF_STRING, IDM_SCENE_PS3_OLED, w!("PS3 XMB Wave (OLED Black)"));
+    let _ = AppendMenuW(
+        hmenu,
+        MF_STRING,
+        IDM_SCENE_PS3_CLASSIC,
+        w!("PS3 XMB Wave (Місячний колір)"),
+    );
+    let _ = AppendMenuW(hmenu, MF_STRING, IDM_SCENE_PSP_WAVE, w!("PSP XMB Wave"));
+    let _ = AppendMenuW(hmenu, MF_STRING, IDM_SCENE_PS4_FLOW, w!("PS4 Flow Wave"));
+
+    let scene_id = match cfg.scene {
+        SceneId::Ps2Original => IDM_SCENE_PS2_ORIGINAL as u32,
+        SceneId::Ps2Vivid => IDM_SCENE_PS2_VIVID as u32,
+        SceneId::Ps2Towers => IDM_SCENE_PS2_TOWERS as u32,
+        SceneId::Ps3Oled => IDM_SCENE_PS3_OLED as u32,
+        SceneId::Ps3Classic => IDM_SCENE_PS3_CLASSIC as u32,
+        SceneId::PspWave => IDM_SCENE_PSP_WAVE as u32,
+        SceneId::Ps4Flow => IDM_SCENE_PS4_FLOW as u32,
     };
     let _ = CheckMenuRadioItem(
         hmenu,
-        IDM_MODE_MENU as u32,
-        IDM_MODE_TRAIL as u32,
-        mode_id,
+        IDM_SCENE_PS2_ORIGINAL as u32,
+        IDM_SCENE_PS4_FLOW as u32,
+        scene_id,
         MF_BYCOMMAND.0,
     );
 
@@ -295,7 +317,6 @@ unsafe fn create_orb_icon() -> HICON {
                     continue;
                 }
 
-                // High-contrast electric cyan halo (#1CA8FF) + pure white core (#FFFFFF)
                 let d = (1.0 - r2).max(0.0);
                 let halo = d.powf(1.85);
                 let core = (-r2 * 10.5).exp();
