@@ -1,0 +1,7 @@
+/target
+ps2-orbs.ini
+*.bmp
+*.png
+*.log
+.DS_Store
+Thumbs.db
